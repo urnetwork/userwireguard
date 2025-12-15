@@ -8,7 +8,7 @@ package device
 import (
 	"errors"
 
-	"github.com/urnetwork/userwireguard/conn"
+	"github.com/urnetwork/userwireguard/v2025/conn"
 )
 
 type DummyDatagram struct {
