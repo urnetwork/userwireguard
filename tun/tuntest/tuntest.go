@@ -11,7 +11,7 @@ import (
 	"net/netip"
 	"os"
 
-	"github.com/urnetwork/userwireguard/tun"
+	"github.com/urnetwork/userwireguard/v2025/tun"
 )
 
 func Ping(dst, src netip.Addr) []byte {
