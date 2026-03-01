@@ -100,8 +100,8 @@ func (e *StdNetEndpoint) ToBytes() []byte {
 	return b
 }
 
-func listenNet(network string, port int) (*net.UDPConn, int, error) {
-	conn, err := listenConfig().ListenPacket(context.Background(), network, ":"+strconv.Itoa(port))
+func listenNet(network string, addr string) (*net.UDPConn, int, error) {
+	conn, err := listenConfig().ListenPacket(context.Background(), network, addr)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -118,7 +118,7 @@ func listenNet(network string, port int) (*net.UDPConn, int, error) {
 	return conn.(*net.UDPConn), uaddr.Port, nil
 }
 
-func (s *StdNetBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
+func (s *StdNetBind) Open(bindIpv4 string, bindIpv6 string, uport uint16) ([]ReceiveFunc, uint16, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -137,13 +137,13 @@ again:
 	var v4pc *ipv4.PacketConn
 	var v6pc *ipv6.PacketConn
 
-	v4conn, port, err = listenNet("udp4", port)
+	v4conn, port, err = listenNet("udp4", net.JoinHostPort(bindIpv4, strconv.Itoa(port)))
 	if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
 		return nil, 0, err
 	}
 
 	// Listen on the same port as we're using for ipv4.
-	v6conn, port, err = listenNet("udp6", port)
+	v6conn, port, err = listenNet("udp6", net.JoinHostPort(bindIpv6, strconv.Itoa(port)))
 	if uport == 0 && errors.Is(err, syscall.EADDRINUSE) && tries < 100 {
 		v4conn.Close()
 		tries++

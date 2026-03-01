@@ -41,6 +41,8 @@ type Device struct {
 		stopping sync.WaitGroup
 		sync.RWMutex
 		bind          conn.Bind // bind interface
+		bindIpv4      string
+		bindIpv6      string
 		port          uint16    // listening port
 		fwmark        uint32    // mark value (0 = disabled)
 		brokenRoaming bool
@@ -477,7 +479,7 @@ func (device *Device) BindUpdate() error {
 	var recvFns []conn.ReceiveFunc
 	netc := &device.net
 
-	recvFns, netc.port, err = netc.bind.Open(netc.port)
+	recvFns, netc.port, err = netc.bind.Open(netc.bindIpv4, netc.bindIpv6, netc.port)
 	if err != nil {
 		netc.port = 0
 		return err

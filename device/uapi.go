@@ -21,6 +21,13 @@ const (
 	IpcErrorPortInUse = 2
 )
 
+type Config struct {
+	BindIpv4 *string
+	BindIpv6 *string
+
+	wgtypes.Config
+}
+
 type IPCError struct {
 	code int64 // error code
 	err  error // underlying/wrapped error
@@ -176,6 +183,12 @@ func (device *Device) IpcGet() (*wgtypes.Device, error) {
 // This function implements the WireGuard configuration protocol "set" operation.
 // See https://www.wireguard.com/xplatform/#configuration-protocol for details.
 func (device *Device) IpcSet(deviceConfig *wgtypes.Config) (err error) {
+	return device.IpcSet2(&Config{
+		Config: *deviceConfig,
+	})
+}
+
+func (device *Device) IpcSet2(deviceConfig *Config) (err error) {
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 
@@ -206,6 +219,8 @@ func (device *Device) IpcSet(deviceConfig *wgtypes.Config) (err error) {
 
 	// listen port
 
+	bindUpdate := false
+
 	if deviceConfig.ListenPort != nil {
 		device.log.Verbosef("UAPI: Updating listen port")
 
@@ -213,9 +228,31 @@ func (device *Device) IpcSet(deviceConfig *wgtypes.Config) (err error) {
 		device.net.port = uint16(*deviceConfig.ListenPort)
 		device.net.Unlock()
 
-		// update port and rebind
+		bindUpdate = true
+	}
+	if deviceConfig.BindIpv4 != nil {
+		device.log.Verbosef("UAPI: Updating listen ipv4")
+
+		device.net.Lock()
+		device.net.bindIpv4 = *deviceConfig.BindIpv4
+		device.net.Unlock()
+
+		bindUpdate = true
+	}
+	if deviceConfig.BindIpv6 != nil {
+		device.log.Verbosef("UAPI: Updating listen ipv6")
+
+		device.net.Lock()
+		device.net.bindIpv6 = *deviceConfig.BindIpv6
+		device.net.Unlock()
+
+		bindUpdate = true
+	}
+
+	if bindUpdate {
+		// update bind
 		if err := device.BindUpdate(); err != nil {
-			return ipcErrorf(IpcErrorPortInUse, "failed to set listen port: %w", err)
+			return ipcErrorf(IpcErrorPortInUse, "failed to rebind: %w", err)
 		}
 	}
 

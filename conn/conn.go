@@ -32,7 +32,7 @@ type Bind interface {
 	// Open puts the Bind into a listening state on a given port and reports the actual
 	// port that it bound to. Passing zero results in a random selection.
 	// fns is the set of functions that will be called to receive packets.
-	Open(port uint16) (fns []ReceiveFunc, actualPort uint16, err error)
+	Open(bindIpv4 string, bindIpv6 string, port uint16) (fns []ReceiveFunc, actualPort uint16, err error)
 
 	// Close closes the Bind listener.
 	// All fns returned by Open must return net.ErrClosed after a call to Close.
