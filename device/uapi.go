@@ -24,6 +24,10 @@ const (
 type Config struct {
 	BindIpv4 *string
 	BindIpv6 *string
+	// Drain, when true, expires all peer keypairs before applying any other
+	// config changes. Useful for signalling an imminent server restart so that
+	// clients re-handshake quickly rather than waiting for natural session expiry.
+	Drain bool
 
 	wgtypes.Config
 }
@@ -197,6 +201,13 @@ func (device *Device) IpcSet2(deviceConfig *Config) (err error) {
 			device.log.Errorf("%v", err)
 		}
 	}()
+
+	// Drain peers before applying any other changes if requested.
+
+	if deviceConfig.Drain {
+		device.log.Verbosef("UAPI: Draining all peer sessions")
+		device.DrainPeers()
+	}
 
 	// Configuring Device //
 
