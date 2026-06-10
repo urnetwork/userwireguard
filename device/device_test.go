@@ -483,7 +483,7 @@ type fakeBindSized struct {
 	size int
 }
 
-func (b *fakeBindSized) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
+func (b *fakeBindSized) Open(bindIpv4 string, bindIpv6 string, port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
 	return nil, 0, nil
 }
 func (b *fakeBindSized) Close() error                                  { return nil }

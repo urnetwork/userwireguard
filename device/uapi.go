@@ -316,6 +316,11 @@ func (device *Device) IpcSet2(deviceConfig *Config) (err error) {
 		if peerConfig.Remove {
 			device.log.Verbosef("%v - UAPI: Removing", currentPeer)
 			device.RemovePeer(currentPeer.handshake.remoteStatic)
+			// the peer is stopped and unregistered; skip the rest of the config
+			// block, in particular handlePeerPostConfig, which would otherwise
+			// restart the removed peer's routines (matches the upstream uapi
+			// behavior of ignoring all fields after "remove")
+			continue
 		}
 
 		// preshared key
@@ -347,9 +352,12 @@ func (device *Device) IpcSet2(deviceConfig *Config) (err error) {
 			if err != nil {
 				return ipcErrorf(IpcErrorInvalid, "failed to set endpoint %v: %w", endpStr, err)
 			}
+			// unlock immediately (not deferred): a deferred unlock would hold the
+			// lock until IpcSet2 returns, and would self-deadlock if the same peer
+			// appears twice in one config with an endpoint
 			currentPeer.endpoint.Lock()
-			defer currentPeer.endpoint.Unlock()
 			currentPeer.endpoint.val = endpoint
+			currentPeer.endpoint.Unlock()
 		}
 
 		// persistent keepalive interval

@@ -61,7 +61,8 @@ func (c ChannelEndpoint) ToString() string { return fmt.Sprintf("127.0.0.1:%d", 
 
 func (c ChannelEndpoint) ToBytes() []byte { return []byte{byte(c)} }
 
-func (c *ChannelBind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
+// the bind addresses are ignored: channel binds are synthetic endpoints
+func (c *ChannelBind) Open(bindIpv4 string, bindIpv6 string, port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
 	c.closeSignal = make(chan bool)
 	fns = append(fns, c.makeReceiveFunc(*c.rx4))
 	fns = append(fns, c.makeReceiveFunc(*c.rx6))
