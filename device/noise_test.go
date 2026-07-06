@@ -10,9 +10,9 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/urnetwork/userwireguard/conn"
-	"github.com/urnetwork/userwireguard/logger"
-	"github.com/urnetwork/userwireguard/tun/tuntest"
+	"github.com/urnetwork/userwireguard/v2026/conn"
+	"github.com/urnetwork/userwireguard/v2026/logger"
+	"github.com/urnetwork/userwireguard/v2026/tun/tuntest"
 )
 
 func TestCurveWrappers(t *testing.T) {
