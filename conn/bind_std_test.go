@@ -6,7 +6,9 @@ import (
 
 func TestStdNetBindReceiveFuncAfterClose(t *testing.T) {
 	bind := NewStdNetBind().(*StdNetBind)
-	fns, _, err := bind.Open(0)
+	// empty bind addresses are "any", which is what the upstream Open(0) meant
+	// before this fork added explicit ipv4/ipv6 bind addresses
+	fns, _, err := bind.Open("", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
