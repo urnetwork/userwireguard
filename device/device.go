@@ -43,8 +43,8 @@ type Device struct {
 		bind          conn.Bind // bind interface
 		bindIpv4      string
 		bindIpv6      string
-		port          uint16    // listening port
-		fwmark        uint32    // mark value (0 = disabled)
+		port          uint16 // listening port
+		fwmark        uint32 // mark value (0 = disabled)
 		brokenRoaming bool
 	}
 
@@ -62,6 +62,12 @@ type Device struct {
 	rate struct {
 		underLoadUntil atomic.Int64
 		limiter        ratelimiter.Ratelimiter
+	}
+
+	receive struct {
+		peerQueueDropPacketCount       atomic.Uint64
+		decryptionQueueDropPacketCount atomic.Uint64
+		routineFailureCount            atomic.Uint64
 	}
 
 	allowedips    AllowedIPs
@@ -225,6 +231,25 @@ func (device *Device) IsUnderLoad() bool {
 	}
 	// check if recently under load
 	return device.rate.underLoadUntil.Load() > now.UnixNano()
+}
+
+// InboundPeerQueueDropPacketCount reports encrypted-datagram admission drops
+// made to keep one overloaded peer from parking the shared socket receiver.
+func (device *Device) InboundPeerQueueDropPacketCount() uint64 {
+	return device.receive.peerQueueDropPacketCount.Load()
+}
+
+// InboundDecryptionQueueDropPacketCount reports ingress packets refused when
+// the device-global crypto workers had no queue capacity. Refusal keeps CPU
+// saturation from parking either shared socket receiver.
+func (device *Device) InboundDecryptionQueueDropPacketCount() uint64 {
+	return device.receive.decryptionQueueDropPacketCount.Load()
+}
+
+// ReceiveRoutineFailureCount reports socket receive routines which ended on
+// an unexpected error and forced the device to close for owner-level recovery.
+func (device *Device) ReceiveRoutineFailureCount() uint64 {
+	return device.receive.routineFailureCount.Load()
 }
 
 func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {

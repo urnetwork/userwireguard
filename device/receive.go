@@ -38,6 +38,61 @@ type QueueInboundElementsContainer struct {
 	elems []*QueueInboundElement
 }
 
+// releaseInboundElements returns a batch which was not admitted to either
+// receive queue. No crypto worker or sequential receiver may own the batch.
+func (device *Device) releaseInboundElements(elemsContainer *QueueInboundElementsContainer) {
+	for _, elem := range elemsContainer.elems {
+		device.PutMessageBuffer(elem.buffer)
+		device.PutInboundElement(elem)
+	}
+	device.PutInboundElementsContainer(elemsContainer)
+}
+
+// dispatchInboundElements isolates the shared socket reader from a slow peer.
+// The outer carrier is a datagram socket, so refusal here is recoverable through
+// WireGuard and inner-protocol retransmission; waiting would head-of-line block
+// every unrelated peer on the same IPv4 or IPv6 receive routine.
+func (device *Device) dispatchInboundElements(peer *Peer, elemsContainer *QueueInboundElementsContainer) bool {
+	// Start and Stop hold peer.state while replacing the queue consumer. Never
+	// wait behind that lifecycle on the shared reader, and do not enqueue after
+	// Stop's terminal nil marker.
+	if !peer.state.TryLock() {
+		device.receive.peerQueueDropPacketCount.Add(uint64(len(elemsContainer.elems)))
+		device.releaseInboundElements(elemsContainer)
+		return false
+	}
+	defer peer.state.Unlock()
+
+	if !peer.isRunning.Load() {
+		device.releaseInboundElements(elemsContainer)
+		return false
+	}
+	select {
+	case peer.queue.inbound.c <- elemsContainer:
+	default:
+		device.receive.peerQueueDropPacketCount.Add(uint64(len(elemsContainer.elems)))
+		device.releaseInboundElements(elemsContainer)
+		return false
+	}
+
+	// Crypto workers are device-global. Their queue is another shared boundary,
+	// so CPU saturation must refuse a datagram rather than park an IPv4/IPv6
+	// socket reader. The container is already visible to this peer's sequential
+	// receiver; mark it as undecrypted and unlock it so that receiver performs
+	// the ordinary buffer/pool release without interpreting encrypted bytes.
+	select {
+	case device.queue.decryption.c <- elemsContainer:
+		return true
+	default:
+		device.receive.decryptionQueueDropPacketCount.Add(uint64(len(elemsContainer.elems)))
+		for _, elem := range elemsContainer.elems {
+			elem.packet = nil
+		}
+		elemsContainer.Unlock()
+		return false
+	}
+}
+
 // clearPointers clears elem fields that contain pointers.
 // This makes the garbage collector's life easier and
 // avoids accidentally keeping other objects around unnecessarily.
@@ -114,6 +169,9 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 			}
 			device.log.Verbosef("Failed to receive %s packet: %v", recvName, err)
 			if neterr, ok := err.(net.Error); ok && !neterr.Temporary() {
+				device.receive.routineFailureCount.Add(1)
+				device.log.Errorf("Receive routine %s failed permanently: %v", recvName, err)
+				go device.Close()
 				return
 			}
 			if deathSpiral < 10 {
@@ -121,6 +179,9 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				time.Sleep(time.Second / 3)
 				continue
 			}
+			device.receive.routineFailureCount.Add(1)
+			device.log.Errorf("Receive routine %s exceeded its retry budget: %v", recvName, err)
+			go device.Close()
 			return
 		}
 		deathSpiral = 0
@@ -220,16 +281,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 			}
 		}
 		for peer, elemsContainer := range elemsByPeer {
-			if peer.isRunning.Load() {
-				peer.queue.inbound.c <- elemsContainer
-				device.queue.decryption.c <- elemsContainer
-			} else {
-				for _, elem := range elemsContainer.elems {
-					device.PutMessageBuffer(elem.buffer)
-					device.PutInboundElement(elem)
-				}
-				device.PutInboundElementsContainer(elemsContainer)
-			}
+			device.dispatchInboundElements(peer, elemsContainer)
 			delete(elemsByPeer, peer)
 		}
 	}
