@@ -189,12 +189,27 @@ func (device *Device) upLocked() error {
 	device.peers.RLock()
 	for _, peer := range device.peers.keyMap {
 		peer.Start()
+		peer.SendHandshakeInitiation(false)
 		if peer.persistentKeepaliveInterval.Load() > 0 {
 			peer.SendKeepalive()
 		}
 	}
 	device.peers.RUnlock()
 	return nil
+}
+
+// DrainPeers expires the current keypairs for all peers, causing each peer to
+// immediately initiate a new handshake on the next send attempt. Call this
+// before gracefully shutting down or restarting the device so that clients
+// re-establish sessions with the new instance quickly rather than waiting up
+// to RekeyAfterTime (120 s) for natural expiry.
+func (device *Device) DrainPeers() {
+	device.peers.RLock()
+	defer device.peers.RUnlock()
+	for _, peer := range device.peers.keyMap {
+		peer.ExpireCurrentKeypairs()
+	}
+	device.log.Verbosef("DrainPeers: expired keypairs for %d peer(s)", len(device.peers.keyMap))
 }
 
 // downLocked attempts to bring the device down.
