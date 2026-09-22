@@ -4,9 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/urnetwork/userwireguard/conn"
-	"github.com/urnetwork/userwireguard/logger"
-	"github.com/urnetwork/userwireguard/tun/tuntest"
+	"github.com/urnetwork/userwireguard/v2026/conn"
+	"github.com/urnetwork/userwireguard/v2026/logger"
+	"github.com/urnetwork/userwireguard/v2026/tun/tuntest"
 )
 
 type permanentReceiveError struct{}
