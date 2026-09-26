@@ -11,10 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/urnetwork/userwireguard/conn"
-	"github.com/urnetwork/userwireguard/logger"
-	"github.com/urnetwork/userwireguard/ratelimiter"
-	"github.com/urnetwork/userwireguard/tun"
+	"github.com/urnetwork/userwireguard/v2026/conn"
+	"github.com/urnetwork/userwireguard/v2026/logger"
+	"github.com/urnetwork/userwireguard/v2026/ratelimiter"
+	"github.com/urnetwork/userwireguard/v2026/tun"
 )
 
 type Device struct {
