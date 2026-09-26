@@ -1,4 +1,4 @@
-module github.com/urnetwork/userwireguard
+module github.com/urnetwork/userwireguard/v2026
 
 go 1.23.1
 
