@@ -138,6 +138,7 @@ func (device *Device) IpcGet() (*wgtypes.Device, error) {
 		if peer.endpoint.val != nil {
 			endpoint, err := net.ResolveUDPAddr("udp", peer.endpoint.val.ToString())
 			if err != nil {
+				peer.endpoint.Unlock()
 				return nil, ipcErrorf(IpcErrorInvalid, "failed to parse peer endpoint: %w", err)
 			}
 			wgPeer.Endpoint = endpoint
@@ -346,8 +347,7 @@ func (device *Device) IpcSet2(deviceConfig *Config) (err error) {
 
 		if peerConfig.Endpoint != nil {
 			device.log.Verbosef("%v - UAPI: Updating endpoint", currentPeer)
-			endp := *peerConfig.Endpoint
-			endpStr := fmt.Sprintf("%s:%d", endp.IP.String(), endp.Port)
+			endpStr := peerConfig.Endpoint.String()
 			endpoint, err := device.net.bind.ParseEndpoint(endpStr)
 			if err != nil {
 				return ipcErrorf(IpcErrorInvalid, "failed to set endpoint %v: %w", endpStr, err)

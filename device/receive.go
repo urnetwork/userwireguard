@@ -125,6 +125,12 @@ func (peer *Peer) keepKeyFreshReceiving() {
  * IPv4 and IPv6 (separately)
  */
 func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.ReceiveFunc) {
+	device.routineReceiveIncoming(maxBatchSize, recv, time.Sleep)
+}
+
+// The retry wait is supplied separately so error handling can be exercised with
+// controlled retries while the public receive routine keeps its normal backoff.
+func (device *Device) routineReceiveIncoming(maxBatchSize int, recv conn.ReceiveFunc, retryWait func(time.Duration)) {
 	recvName := recv.PrettyName()
 	defer func() {
 		device.log.Verbosef("Routine: receive incoming %s - stopped", recvName)
@@ -176,7 +182,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 			}
 			if deathSpiral < 10 {
 				deathSpiral++
-				time.Sleep(time.Second / 3)
+				retryWait(time.Second / 3)
 				continue
 			}
 			device.receive.routineFailureCount.Add(1)
