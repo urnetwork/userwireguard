@@ -1,6 +1,6 @@
 module github.com/urnetwork/userwireguard
 
-go 1.23.1
+go 1.27.3
 
 require (
 	golang.org/x/crypto v0.37.0
