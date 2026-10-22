@@ -6,7 +6,7 @@
 package device
 
 import (
-	"github.com/urnetwork/userwireguard/tun"
+	"github.com/urnetwork/userwireguard/v2026/tun"
 )
 
 const DefaultMTU = 1420
