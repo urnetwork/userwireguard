@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/urnetwork/userwireguard/conn/bindtest"
-	"github.com/urnetwork/userwireguard/logger"
+	"github.com/urnetwork/userwireguard/v2026/conn/bindtest"
+	"github.com/urnetwork/userwireguard/v2026/logger"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
