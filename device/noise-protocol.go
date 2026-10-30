@@ -338,13 +338,22 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 }
 
 func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
+	peer, _, _ := device.consumeMessageInitiation(msg)
+	return peer
+}
+
+// consumeMessageInitiation also reports a miss: the initiation decrypted to a
+// static key the device has no peer for. A miss is reported only after the
+// static key decrypts, which needs the device's public key. The caller may
+// create a peer for the key and consume the same message again.
+func (device *Device) consumeMessageInitiation(msg *MessageInitiation) (peer *Peer, missKey NoisePublicKey, miss bool) {
 	var (
 		hash     [blake2s.Size]byte
 		chainKey [blake2s.Size]byte
 	)
 
 	if msg.Type != MessageInitiationType {
-		return nil
+		return
 	}
 
 	device.staticIdentity.RLock()
@@ -359,21 +368,24 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	var key [chacha20poly1305.KeySize]byte
 	ss, err := device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
 	if err != nil {
-		return nil
+		return nil, NoisePublicKey{}, false
 	}
 	KDF2(&chainKey, &key, chainKey[:], ss[:])
 	aead, _ := chacha20poly1305.New(key[:])
 	_, err = aead.Open(peerPK[:0], ZeroNonce[:], msg.Static[:], hash[:])
 	if err != nil {
-		return nil
+		return nil, NoisePublicKey{}, false
 	}
 	mixHash(&hash, &hash, msg.Static[:])
 
 	// lookup peer
 
-	peer := device.LookupPeer(peerPK)
-	if peer == nil || !peer.isRunning.Load() {
-		return nil
+	peer = device.LookupPeer(peerPK)
+	if peer == nil {
+		return nil, peerPK, true
+	}
+	if !peer.isRunning.Load() {
+		return nil, NoisePublicKey{}, false
 	}
 
 	handshake := &peer.handshake
@@ -386,7 +398,7 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 
 	if isZero(handshake.precomputedStaticStatic[:]) {
 		handshake.mutex.RUnlock()
-		return nil
+		return nil, NoisePublicKey{}, false
 	}
 	KDF2(
 		&chainKey,
@@ -398,7 +410,7 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	_, err = aead.Open(timestamp[:0], ZeroNonce[:], msg.Timestamp[:], hash[:])
 	if err != nil {
 		handshake.mutex.RUnlock()
-		return nil
+		return nil, NoisePublicKey{}, false
 	}
 	mixHash(&hash, &hash, msg.Timestamp[:])
 
@@ -409,11 +421,11 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	handshake.mutex.RUnlock()
 	if replay {
 		device.log.Verbosef("%v - ConsumeMessageInitiation: handshake replay @ %v", peer, timestamp)
-		return nil
+		return nil, NoisePublicKey{}, false
 	}
 	if flood {
 		device.log.Verbosef("%v - ConsumeMessageInitiation: handshake flood", peer)
-		return nil
+		return nil, NoisePublicKey{}, false
 	}
 
 	// update handshake state
@@ -438,7 +450,7 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	setZero(hash[:])
 	setZero(chainKey[:])
 
-	return peer
+	return peer, NoisePublicKey{}, false
 }
 
 func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error) {

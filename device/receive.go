@@ -417,7 +417,12 @@ func (device *Device) RoutineHandshake(id int) {
 
 			// consume initiation
 
-			peer := device.ConsumeMessageInitiation(&msg)
+			peer, missKey, miss := device.consumeMessageInitiation(&msg)
+			if peer == nil && miss && device.resolvePeerMiss(missKey) {
+				// the key has a peer now; consume the same initiation against
+				// it so the client's first handshake completes
+				peer, _, _ = device.consumeMessageInitiation(&msg)
+			}
 			if peer == nil {
 				device.log.Verbosef("Received invalid initiation message from %s", elem.endpoint.ToString())
 				goto skip
