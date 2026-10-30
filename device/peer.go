@@ -24,6 +24,7 @@ type Peer struct {
 	txBytes           atomic.Uint64  // bytes send to peer (endpoint)
 	rxBytes           atomic.Uint64  // bytes received from peer
 	lastHandshakeNano atomic.Int64   // nano seconds since epoch
+	createdNano       atomic.Int64   // nano seconds since epoch
 
 	endpoint struct {
 		sync.Mutex
@@ -62,19 +63,16 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 		return nil, errors.New("device closed")
 	}
 
-	// lock resources
+	// lock resources. The static identity stays read-locked until the peer
+	// is in the map, so a concurrent SetPrivateKey either precedes the DH
+	// below or recomputes it for this peer.
 	device.staticIdentity.RLock()
 	defer device.staticIdentity.RUnlock()
 
-	device.peers.Lock()
-	defer device.peers.Unlock()
-
-	// check if over limit
-	if len(device.peers.keyMap) >= MaxPeers {
-		return nil, errors.New("too many peers")
-	}
-
-	// create peer
+	// Build the peer before taking the peer map lock: the static-static DH
+	// and the queues are the costly part, and no one can see the peer until
+	// it is in the map. Peers created on demand arrive in bursts, and every
+	// handshake worker's LookupPeer waits on this lock.
 	peer := new(Peer)
 
 	peer.cookieGenerator.Init(pk)
@@ -82,12 +80,6 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	peer.queue.outbound = newAutodrainingOutboundQueue(device)
 	peer.queue.inbound = newAutodrainingInboundQueue(device)
 	peer.queue.staged = make(chan *QueueOutboundElementsContainer, QueueStagedSize)
-
-	// map public key
-	_, ok := device.peers.keyMap[pk]
-	if ok {
-		return nil, errors.New("adding existing peer")
-	}
 
 	// pre-compute DH
 	handshake := &peer.handshake
@@ -105,7 +97,22 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	// init timers
 	peer.timersInit()
 
+	device.peers.Lock()
+	defer device.peers.Unlock()
+
+	// check if over limit
+	if len(device.peers.keyMap) >= MaxPeers {
+		return nil, errors.New("too many peers")
+	}
+
+	// map public key
+	_, ok := device.peers.keyMap[pk]
+	if ok {
+		return nil, errors.New("adding existing peer")
+	}
+
 	// add
+	peer.createdNano.Store(time.Now().UnixNano())
 	device.peers.keyMap[pk] = peer
 
 	return peer, nil

@@ -74,6 +74,8 @@ type Device struct {
 	indexTable    IndexTable
 	cookieChecker CookieChecker
 
+	peerMiss peerMissState
+
 	pool struct {
 		inboundElementsContainer  *WaitPool
 		outboundElementsContainer *WaitPool
