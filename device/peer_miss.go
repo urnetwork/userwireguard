@@ -48,9 +48,9 @@ type PeerMissConfig struct {
 //
 // The handler should answer from memory. A handshake worker waits for it for
 // at most PeerMissSettings.HandlerTimeout and then drops the initiation; an
-// answer that arrives later is still applied, so the client's next initiation
-// (sent after RekeyTimeout) finds the peer. A handler that panics refuses the
-// key without the refusal being remembered.
+// answer that arrives later is still applied unless configuration changes
+// invalidated it, so the client's next initiation (sent after RekeyTimeout)
+// finds the peer. A handler that panics refuses the key without caching it.
 type PeerMissHandler func(publicKey NoisePublicKey) (config PeerMissConfig, ok bool)
 
 // PeerMissSettings configures how the device resolves initiations from keys
@@ -71,18 +71,14 @@ type PeerMissSettings struct {
 	HandlerTimeout time.Duration
 }
 
-const (
-	defaultPeerMissNegativeMaxEntries = 1 << 16
-	defaultPeerMissHandlerTimeout     = 100 * time.Millisecond
-)
-
+// Returns the default limits for resolving unknown peer keys.
 func DefaultPeerMissSettings() *PeerMissSettings {
 	return &PeerMissSettings{
 		NegativeTtl:        10 * time.Second,
-		NegativeMaxEntries: defaultPeerMissNegativeMaxEntries,
+		NegativeMaxEntries: 64 * 1024,
 		RatePerSecond:      1024,
 		Burst:              2048,
-		HandlerTimeout:     defaultPeerMissHandlerTimeout,
+		HandlerTimeout:     100 * time.Millisecond,
 	}
 }
 
@@ -107,19 +103,25 @@ type PeerMissStats struct {
 	CreateFailures uint64
 }
 
+// Identifies one handler call, including its authority to install a peer.
+type peerMissResolution struct {
+	done chan bool
+}
+
+// Tracks resolution ownership, rate limits and remembered refusals.
 type peerMissState struct {
 	enabled atomic.Bool
 
-	mutex    sync.Mutex
-	settings PeerMissSettings
-	now      func() time.Time
+	stateLock sync.Mutex
+	settings  PeerMissSettings
+	now       func() time.Time
 	// refusal expiry by key
 	refused   map[NoisePublicKey]time.Time
 	lastPurge time.Time
 	// keys whose handler call has not finished
-	inflight map[NoisePublicKey]struct{}
-	tokens   float64
-	refilled time.Time
+	publicKeyResolutions map[NoisePublicKey]*peerMissResolution
+	tokens               float64
+	refilled             time.Time
 
 	acceptedCount         atomic.Uint64
 	refusedCount          atomic.Uint64
@@ -131,6 +133,7 @@ type peerMissState struct {
 	createFailureCount    atomic.Uint64
 }
 
+// Reads the clock used for refusal expiry and rate limits.
 func (self *peerMissState) clock() time.Time {
 	if self.now != nil {
 		return self.now()
@@ -138,20 +141,20 @@ func (self *peerMissState) clock() time.Time {
 	return time.Now()
 }
 
-// burstLocked is the token bucket capacity.
-func (self *peerMissState) burstLocked() float64 {
+// Returns the token bucket capacity while the state lock is held.
+func (self *peerMissState) burstWithLock() float64 {
 	if 0 < self.settings.Burst {
 		return float64(self.settings.Burst)
 	}
 	return max(1, self.settings.RatePerSecond)
 }
 
-// takeTokenLocked admits one handler call against the rate.
-func (self *peerMissState) takeTokenLocked(now time.Time) bool {
+// Admits one handler call against the rate while the state lock is held.
+func (self *peerMissState) takeTokenWithLock(now time.Time) bool {
 	if self.settings.RatePerSecond <= 0 {
 		return true
 	}
-	burst := self.burstLocked()
+	burst := self.burstWithLock()
 	if elapsed := now.Sub(self.refilled); 0 < elapsed {
 		self.tokens = min(burst, self.tokens+elapsed.Seconds()*self.settings.RatePerSecond)
 	}
@@ -163,17 +166,14 @@ func (self *peerMissState) takeTokenLocked(now time.Time) bool {
 	return true
 }
 
-// refuseLocked remembers a refusal within the entry bound. Expired refusals
+// Remembers a refusal within the entry bound while the state lock is held. Expired refusals
 // are purged at most once a second; a full cache past that drops an arbitrary
 // entry, which keeps every insertion constant time.
-func (self *peerMissState) refuseLocked(publicKey NoisePublicKey, now time.Time) {
+func (self *peerMissState) refuseWithLock(publicKey NoisePublicKey, now time.Time) {
 	if self.settings.NegativeTtl <= 0 {
 		return
 	}
 	maxEntries := self.settings.NegativeMaxEntries
-	if maxEntries <= 0 {
-		maxEntries = defaultPeerMissNegativeMaxEntries
-	}
 	if maxEntries <= len(self.refused) {
 		if time.Second <= now.Sub(self.lastPurge) {
 			self.lastPurge = now
@@ -195,40 +195,64 @@ func (self *peerMissState) refuseLocked(publicKey NoisePublicKey, now time.Time)
 
 // SetPeerMissSettings installs the miss handler and its bounds. A nil
 // settings or a nil handler turns on-demand peers off. Remembered refusals
-// and the call budget start over.
-func (device *Device) SetPeerMissSettings(settings *PeerMissSettings) {
-	state := &device.peerMiss
-	state.mutex.Lock()
-	defer state.mutex.Unlock()
+// and the call budget start over. Pending answers from the previous handler
+// are discarded.
+func (self *Device) SetPeerMissSettings(settings *PeerMissSettings) {
+	self.ipcMutex.Lock()
+	defer self.ipcMutex.Unlock()
+	state := &self.peerMiss
+	state.stateLock.Lock()
+	defer state.stateLock.Unlock()
 	if settings == nil {
 		state.settings = PeerMissSettings{}
 	} else {
 		state.settings = *settings
 	}
+	defaults := DefaultPeerMissSettings()
 	if state.settings.HandlerTimeout <= 0 {
-		state.settings.HandlerTimeout = defaultPeerMissHandlerTimeout
+		state.settings.HandlerTimeout = defaults.HandlerTimeout
+	}
+	if state.settings.NegativeMaxEntries <= 0 {
+		state.settings.NegativeMaxEntries = defaults.NegativeMaxEntries
 	}
 	state.refused = map[NoisePublicKey]time.Time{}
-	if state.inflight == nil {
-		state.inflight = map[NoisePublicKey]struct{}{}
-	}
+	state.publicKeyResolutions = map[NoisePublicKey]*peerMissResolution{}
 	state.refilled = state.clock()
-	state.tokens = state.burstLocked()
+	state.tokens = state.burstWithLock()
 	state.enabled.Store(state.settings.Handler != nil)
 }
 
 // ClearPeerMissRefusal forgets a remembered refusal for the key, so the next
 // initiation from it asks the handler again. An owner calls this when it
-// starts accepting a key.
-func (device *Device) ClearPeerMissRefusal(publicKey NoisePublicKey) {
-	state := &device.peerMiss
-	state.mutex.Lock()
-	defer state.mutex.Unlock()
-	delete(state.refused, publicKey)
+// starts accepting a key. Pending answers for the old configuration are
+// discarded as well, so an earlier refusal cannot replace this decision.
+func (self *Device) ClearPeerMissRefusal(publicKey NoisePublicKey) {
+	self.ipcMutex.Lock()
+	defer self.ipcMutex.Unlock()
+	self.invalidatePeerMissWithLock(publicKey)
 }
 
-func (device *Device) PeerMissStats() PeerMissStats {
-	state := &device.peerMiss
+// Invalidates a key's pending answer and refusal while the configuration lock is held.
+func (self *Device) invalidatePeerMissWithLock(publicKey NoisePublicKey) {
+	state := &self.peerMiss
+	state.stateLock.Lock()
+	defer state.stateLock.Unlock()
+	delete(state.refused, publicKey)
+	delete(state.publicKeyResolutions, publicKey)
+}
+
+// Invalidates all pending answers and refusals while the configuration lock is held.
+func (self *Device) invalidatePeerMissesWithLock() {
+	state := &self.peerMiss
+	state.stateLock.Lock()
+	defer state.stateLock.Unlock()
+	state.refused = map[NoisePublicKey]time.Time{}
+	state.publicKeyResolutions = map[NoisePublicKey]*peerMissResolution{}
+}
+
+// Returns cumulative resolution counters.
+func (self *Device) PeerMissStats() PeerMissStats {
+	state := &self.peerMiss
 	return PeerMissStats{
 		Accepted:          state.acceptedCount.Load(),
 		Refused:           state.refusedCount.Load(),
@@ -245,52 +269,52 @@ func (device *Device) PeerMissStats() PeerMissStats {
 // has answered. It runs on a handshake worker and holds it for at most the
 // handler timeout. A refused, remembered, coalesced or rate-limited key
 // reports false and the initiation is dropped; its client retries.
-func (device *Device) resolvePeerMiss(publicKey NoisePublicKey) bool {
-	state := &device.peerMiss
+func (self *Device) resolvePeerMiss(publicKey NoisePublicKey) bool {
+	state := &self.peerMiss
 	if !state.enabled.Load() {
 		return false
 	}
-	if peer := device.LookupPeer(publicKey); peer != nil {
+	if peer := self.LookupPeer(publicKey); peer != nil {
 		return true
 	}
 
-	state.mutex.Lock()
+	state.stateLock.Lock()
 	handler := state.settings.Handler
 	if handler == nil {
-		state.mutex.Unlock()
+		state.stateLock.Unlock()
 		return false
 	}
 	now := state.clock()
 	if expiry, ok := state.refused[publicKey]; ok {
 		if now.Before(expiry) {
-			state.mutex.Unlock()
+			state.stateLock.Unlock()
 			state.negativeCacheHitCount.Add(1)
 			return false
 		}
 		delete(state.refused, publicKey)
 	}
-	if _, ok := state.inflight[publicKey]; ok {
-		state.mutex.Unlock()
+	if _, ok := state.publicKeyResolutions[publicKey]; ok {
+		state.stateLock.Unlock()
 		state.coalescedCount.Add(1)
 		return false
 	}
-	if !state.takeTokenLocked(now) {
-		state.mutex.Unlock()
+	if !state.takeTokenWithLock(now) {
+		state.stateLock.Unlock()
 		state.rateLimitedCount.Add(1)
 		return false
 	}
-	state.inflight[publicKey] = struct{}{}
+	resolution := &peerMissResolution{done: make(chan bool, 1)}
+	state.publicKeyResolutions[publicKey] = resolution
 	timeout := state.settings.HandlerTimeout
-	state.mutex.Unlock()
+	state.stateLock.Unlock()
 
-	// The resolution owns the key's in-flight entry and applies the answer
-	// whenever it arrives; the worker only waits for it, within the bound.
-	done := make(chan bool, 1)
-	go device.completePeerMiss(handler, publicKey, done)
+	// The resolution may apply its answer only while it owns this key. The
+	// worker's timeout does not revoke that ownership; configuration does.
+	go self.completePeerMiss(handler, publicKey, resolution)
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
-	case accepted := <-done:
+	case accepted := <-resolution.done:
 		return accepted
 	case <-timer.C:
 		state.handlerTimeoutCount.Add(1)
@@ -301,39 +325,49 @@ func (device *Device) resolvePeerMiss(publicKey NoisePublicKey) bool {
 // completePeerMiss asks the handler and applies its answer: a peer for an
 // accepted key, a remembered refusal for a refused one. The key stays in
 // flight until the peer exists, so no second handler call can start for it.
-func (device *Device) completePeerMiss(handler PeerMissHandler, publicKey NoisePublicKey, done chan<- bool) {
-	state := &device.peerMiss
+func (self *Device) completePeerMiss(handler PeerMissHandler, publicKey NoisePublicKey, resolution *peerMissResolution) {
+	state := &self.peerMiss
 	accepted := false
 	defer func() {
-		done <- accepted
+		resolution.done <- accepted
 	}()
 
 	config, ok, failed := callPeerMissHandler(handler, publicKey)
+	self.ipcMutex.Lock()
+	defer self.ipcMutex.Unlock()
+	current := func() bool {
+		state.stateLock.Lock()
+		defer state.stateLock.Unlock()
+		return state.publicKeyResolutions[publicKey] == resolution
+	}()
+	if !current {
+		return
+	}
 	var createErr error
 	if !failed && ok {
-		_, createErr = device.AddPeerOnDemand(publicKey, config)
+		_, createErr = self.addPeerOnDemandWithLock(publicKey, config)
 	}
 
-	state.mutex.Lock()
-	delete(state.inflight, publicKey)
+	state.stateLock.Lock()
+	delete(state.publicKeyResolutions, publicKey)
 	switch {
 	case failed:
 		state.handlerFailureCount.Add(1)
 	case !ok:
 		state.refusedCount.Add(1)
-		state.refuseLocked(publicKey, state.clock())
+		state.refuseWithLock(publicKey, state.clock())
 	case createErr != nil:
 		state.createFailureCount.Add(1)
 	default:
 		state.acceptedCount.Add(1)
 		accepted = true
 	}
-	state.mutex.Unlock()
+	state.stateLock.Unlock()
 
 	if failed {
-		device.log.Errorf("Peer miss handler failed for %x…", publicKey[:4])
+		self.log.Errorf("Peer miss handler failed for %x…", publicKey[:4])
 	} else if createErr != nil {
-		device.log.Errorf("Could not create on-demand peer %x…: %v", publicKey[:4], createErr)
+		self.log.Errorf("Could not create on-demand peer %x…: %v", publicKey[:4], createErr)
 	}
 }
 
@@ -352,30 +386,34 @@ func callPeerMissHandler(handler PeerMissHandler, publicKey NoisePublicKey) (con
 // configuration, or returns the peer the key already has, unchanged. It is
 // the miss handler's path to the device, and an owner's path for a peer it
 // must reach first (for example to initiate a handshake).
-func (device *Device) AddPeerOnDemand(publicKey NoisePublicKey, config PeerMissConfig) (*Peer, error) {
-	// serialize with configuration and with Up/Down/Close, as IpcSet does, so
-	// a peer is never created into a device that is changing state
-	device.ipcMutex.RLock()
-	defer device.ipcMutex.RUnlock()
+func (self *Device) AddPeerOnDemand(publicKey NoisePublicKey, config PeerMissConfig) (*Peer, error) {
+	self.ipcMutex.Lock()
+	defer self.ipcMutex.Unlock()
+	return self.addPeerOnDemandWithLock(publicKey, config)
+}
 
-	if peer := device.LookupPeer(publicKey); peer != nil {
+// Configures and starts a peer while the configuration lock is held.
+func (self *Device) addPeerOnDemandWithLock(publicKey NoisePublicKey, config PeerMissConfig) (*Peer, error) {
+	if peer := self.LookupPeer(publicKey); peer != nil {
 		return peer, nil
 	}
-	device.staticIdentity.RLock()
-	own := device.staticIdentity.publicKey.Equals(publicKey)
-	device.staticIdentity.RUnlock()
+	self.staticIdentity.RLock()
+	own := self.staticIdentity.publicKey.Equals(publicKey)
+	self.staticIdentity.RUnlock()
 	if own {
 		return nil, errors.New("peer key is the device's own key")
 	}
 
-	peer, err := device.NewPeer(publicKey)
-	if err != nil {
-		// a concurrent creation won; its peer is the key's peer
-		if existing := device.LookupPeer(publicKey); existing != nil {
-			return existing, nil
+	for _, prefix := range config.AllowedIPs {
+		if !prefix.IsValid() {
+			return nil, fmt.Errorf("invalid allowed ip %v", prefix)
 		}
+	}
+	peer, err := self.preparePeerWithLock(publicKey)
+	if err != nil {
 		return nil, err
 	}
+	self.log.Verbosef("%v - Configuring on-demand peer", peer)
 	if config.PresharedKey != nil {
 		peer.handshake.mutex.Lock()
 		peer.handshake.presharedKey = *config.PresharedKey
@@ -387,13 +425,12 @@ func (device *Device) AddPeerOnDemand(publicKey NoisePublicKey, config PeerMissC
 		pkaOn = true
 	}
 	for _, prefix := range config.AllowedIPs {
-		if !prefix.IsValid() {
-			device.RemovePeer(publicKey)
-			return nil, fmt.Errorf("invalid allowed ip %v", prefix)
-		}
-		device.allowedips.Insert(prefix.Masked(), peer)
+		self.allowedips.Insert(prefix.Masked(), peer)
 	}
 	handlePeerPostConfig(peer, true, pkaOn)
+	self.peers.Lock()
+	self.peers.keyMap[publicKey] = peer
+	self.peers.Unlock()
 	return peer, nil
 }
 
@@ -410,31 +447,34 @@ func peerLastActive(peer *Peer) int64 {
 // keys. An idle bound above RejectAfterTime removes only peers that can carry
 // no traffic. Each removal takes the peer lock on its own, so handshakes for
 // other keys proceed between removals.
-func (device *Device) RemoveIdlePeers(idle time.Duration) []NoisePublicKey {
+func (self *Device) RemoveIdlePeers(idle time.Duration) []NoisePublicKey {
 	cutoff := time.Now().Add(-idle).UnixNano()
 	type candidate struct {
 		key  NoisePublicKey
 		peer *Peer
 	}
 	candidates := []candidate{}
-	device.peers.RLock()
-	for key, peer := range device.peers.keyMap {
+	self.peers.RLock()
+	for key, peer := range self.peers.keyMap {
 		if peerLastActive(peer) < cutoff {
 			candidates = append(candidates, candidate{key: key, peer: peer})
 		}
 	}
-	device.peers.RUnlock()
+	self.peers.RUnlock()
 
 	removed := []NoisePublicKey{}
 	for _, c := range candidates {
 		func() {
-			device.peers.Lock()
-			defer device.peers.Unlock()
+			self.ipcMutex.Lock()
+			defer self.ipcMutex.Unlock()
+			self.peers.Lock()
+			defer self.peers.Unlock()
 			// a handshake or a replacement since the scan keeps the peer
-			if device.peers.keyMap[c.key] != c.peer || cutoff <= peerLastActive(c.peer) {
+			if self.peers.keyMap[c.key] != c.peer || cutoff <= peerLastActive(c.peer) {
 				return
 			}
-			removePeerLocked(device, c.peer, c.key)
+			self.invalidatePeerMissWithLock(c.key)
+			removePeerWithLock(self, c.peer, c.key)
 			removed = append(removed, c.key)
 		}()
 	}

@@ -61,9 +61,15 @@ func missClientIp(i int) netip.Addr {
 // settings leaves on-demand peers off, as for an ordinary device.
 func startMissServer(tb testing.TB, bind conn.Bind, settings *PeerMissSettings) *missEndpoint {
 	tb.Helper()
+	return startMissServerWithLogger(tb, bind, settings, logger.NewLogger(logger.LogLevelError, "server: "))
+}
+
+// Builds the same server with a logger installed before any workers start.
+func startMissServerWithLogger(tb testing.TB, bind conn.Bind, settings *PeerMissSettings, log *logger.Logger) *missEndpoint {
+	tb.Helper()
 	sk, pk := missKeyPair(tb)
 	tun := tuntest.NewChannelTUN()
-	dev := NewDevice(tun.TUN(), bind, logger.NewLogger(logger.LogLevelError, "server: "))
+	dev := NewDevice(tun.TUN(), bind, log)
 	privateKey := missWgKey(tb, sk)
 	port := 0
 	if err := dev.IpcSet(&wgtypes.Config{PrivateKey: &privateKey, ListenPort: &port}); err != nil {
@@ -329,9 +335,9 @@ func TestPeerMissRefusalCacheIsBounded(t *testing.T) {
 		_, key := missKeyPair(t)
 		server.dev.resolvePeerMiss(key)
 	}
-	server.dev.peerMiss.mutex.Lock()
+	server.dev.peerMiss.stateLock.Lock()
 	size := len(server.dev.peerMiss.refused)
-	server.dev.peerMiss.mutex.Unlock()
+	server.dev.peerMiss.stateLock.Unlock()
 	if size > 64 {
 		t.Fatalf("refusal cache holds %d keys, bound is 64", size)
 	}

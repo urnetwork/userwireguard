@@ -215,7 +215,7 @@ func (device *Device) IpcSet2(deviceConfig *Config) (err error) {
 			return ipcErrorf(IpcErrorInvalid, "failed to set private key: %w", err)
 		}
 		device.log.Verbosef("UAPI: Updating private key")
-		device.SetPrivateKey(sk)
+		device.setPrivateKeyWithLock(sk)
 	}
 
 	// listen port
@@ -270,7 +270,7 @@ func (device *Device) IpcSet2(deviceConfig *Config) (err error) {
 
 	if deviceConfig.ReplacePeers {
 		device.log.Verbosef("UAPI: Removing all peers")
-		device.RemoveAllPeers()
+		device.removeAllPeersWithLock()
 	}
 
 	for _, peerConfig := range deviceConfig.Peers {
@@ -297,6 +297,13 @@ func (device *Device) IpcSet2(deviceConfig *Config) (err error) {
 		}
 		device.staticIdentity.RUnlock()
 
+		// Removal invalidates a pending miss even when no peer has been
+		// published yet. UpdateOnly must not bypass that invalidation.
+		if peerConfig.Remove {
+			device.removePeerWithLock(publicKey)
+			continue
+		}
+
 		currentPeer := device.LookupPeer(publicKey)
 		created := currentPeer == nil
 
@@ -305,23 +312,11 @@ func (device *Device) IpcSet2(deviceConfig *Config) (err error) {
 		}
 
 		if created {
-			currentPeer, err = device.NewPeer(publicKey)
+			currentPeer, err = device.newPeerWithLock(publicKey)
 			if err != nil {
 				return ipcErrorf(IpcErrorInvalid, "failed to create new peer: %w", err)
 			}
 			device.log.Verbosef("%v - UAPI: Created", currentPeer)
-		}
-
-		// remove peer
-
-		if peerConfig.Remove {
-			device.log.Verbosef("%v - UAPI: Removing", currentPeer)
-			device.RemovePeer(currentPeer.handshake.remoteStatic)
-			// the peer is stopped and unregistered; skip the rest of the config
-			// block, in particular handlePeerPostConfig, which would otherwise
-			// restart the removed peer's routines (matches the upstream uapi
-			// behavior of ignoring all fields after "remove")
-			continue
 		}
 
 		// preshared key
