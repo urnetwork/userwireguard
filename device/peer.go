@@ -58,33 +58,49 @@ type Peer struct {
 	persistentKeepaliveInterval atomic.Uint32
 }
 
-func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
-	if device.isClosed() {
+// Allocates a peer without starting it, serialized with device configuration.
+func (self *Device) NewPeer(publicKey NoisePublicKey) (*Peer, error) {
+	self.ipcMutex.Lock()
+	defer self.ipcMutex.Unlock()
+	return self.newPeerWithLock(publicKey)
+}
+
+// Allocates and publishes a peer while the configuration lock is held.
+func (self *Device) newPeerWithLock(publicKey NoisePublicKey) (*Peer, error) {
+	peer, err := self.preparePeerWithLock(publicKey)
+	if err != nil {
+		return nil, err
+	}
+	self.peers.Lock()
+	self.peers.keyMap[publicKey] = peer
+	self.peers.Unlock()
+	return peer, nil
+}
+
+// Allocates an unpublished peer while the configuration lock is held.
+func (self *Device) preparePeerWithLock(pk NoisePublicKey) (*Peer, error) {
+	if self.isClosed() {
 		return nil, errors.New("device closed")
 	}
 
-	// lock resources. The static identity stays read-locked until the peer
-	// is in the map, so a concurrent SetPrivateKey either precedes the DH
-	// below or recomputes it for this peer.
-	device.staticIdentity.RLock()
-	defer device.staticIdentity.RUnlock()
+	// Read the identity for allocation. The configuration lock keeps it
+	// stable through the caller's later publication of this peer.
+	self.staticIdentity.RLock()
+	defer self.staticIdentity.RUnlock()
 
-	// Build the peer before taking the peer map lock: the static-static DH
-	// and the queues are the costly part, and no one can see the peer until
-	// it is in the map. Peers created on demand arrive in bursts, and every
-	// handshake worker's LookupPeer waits on this lock.
+	// Keep DH and allocation outside the peer-map lock used by packet lookup.
 	peer := new(Peer)
 
 	peer.cookieGenerator.Init(pk)
-	peer.device = device
-	peer.queue.outbound = newAutodrainingOutboundQueue(device)
-	peer.queue.inbound = newAutodrainingInboundQueue(device)
+	peer.device = self
+	peer.queue.outbound = newAutodrainingOutboundQueue(self)
+	peer.queue.inbound = newAutodrainingInboundQueue(self)
 	peer.queue.staged = make(chan *QueueOutboundElementsContainer, QueueStagedSize)
 
 	// pre-compute DH
 	handshake := &peer.handshake
 	handshake.mutex.Lock()
-	handshake.precomputedStaticStatic, _ = device.staticIdentity.privateKey.sharedSecret(pk)
+	handshake.precomputedStaticStatic, _ = self.staticIdentity.privateKey.sharedSecret(pk)
 	handshake.remoteStatic = pk
 	handshake.mutex.Unlock()
 
@@ -97,23 +113,22 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	// init timers
 	peer.timersInit()
 
-	device.peers.Lock()
-	defer device.peers.Unlock()
+	self.peers.Lock()
+	defer self.peers.Unlock()
 
 	// check if over limit
-	if len(device.peers.keyMap) >= MaxPeers {
+	if len(self.peers.keyMap) >= MaxPeers {
 		return nil, errors.New("too many peers")
 	}
 
 	// map public key
-	_, ok := device.peers.keyMap[pk]
+	_, ok := self.peers.keyMap[pk]
 	if ok {
 		return nil, errors.New("adding existing peer")
 	}
 
-	// add
+	// The caller publishes the peer after any initial configuration.
 	peer.createdNano.Store(time.Now().UnixNano())
-	device.peers.keyMap[pk] = peer
 
 	return peer, nil
 }

@@ -95,6 +95,8 @@ type Device struct {
 		mtu    atomic.Int32
 	}
 
+	// Serializes complete peer configuration, miss-result installation and
+	// removal. Packet lookup never takes this lock.
 	ipcMutex sync.RWMutex
 	closed   chan struct{}
 	log      *logger.Logger
@@ -134,8 +136,8 @@ func (device *Device) isUp() bool {
 	return device.deviceState() == deviceStateUp
 }
 
-// Must hold device.peers.Lock()
-func removePeerLocked(device *Device, peer *Peer, key NoisePublicKey) {
+// Stops and removes a peer while the configuration and peer-map locks are held.
+func removePeerWithLock(device *Device, peer *Peer, key NoisePublicKey) {
 	// stop routing and processing of packets
 	device.allowedips.RemoveByPeer(peer)
 	peer.Stop()
@@ -145,73 +147,68 @@ func removePeerLocked(device *Device, peer *Peer, key NoisePublicKey) {
 }
 
 // changeState attempts to change the device state to match want.
-func (device *Device) changeState(want deviceState) (err error) {
-	device.state.Lock()
-	defer device.state.Unlock()
-	old := device.deviceState()
+func (self *Device) changeState(want deviceState) (err error) {
+	self.state.Lock()
+	defer self.state.Unlock()
+	self.ipcMutex.Lock()
+	defer self.ipcMutex.Unlock()
+	old := self.deviceState()
 	if old == deviceStateClosed {
 		// once closed, always closed
-		device.log.Verbosef("Interface closed, ignored requested state %s", want)
+		self.log.Verbosef("Interface closed, ignored requested state %s", want)
 		return nil
 	}
 	switch want {
 	case old:
 		return nil
 	case deviceStateUp:
-		device.state.state.Store(uint32(deviceStateUp))
-		err = device.upLocked()
+		self.state.state.Store(uint32(deviceStateUp))
+		err = self.upWithLock()
 		if err == nil {
 			break
 		}
 		fallthrough // up failed; bring the device all the way back down
 	case deviceStateDown:
-		device.state.state.Store(uint32(deviceStateDown))
-		errDown := device.downLocked()
+		self.state.state.Store(uint32(deviceStateDown))
+		errDown := self.downWithLock()
 		if err == nil {
 			err = errDown
 		}
 	}
-	device.log.Verbosef("Interface state was %s, requested %s, now %s", old, want, device.deviceState())
+	self.log.Verbosef("Interface state was %s, requested %s, now %s", old, want, self.deviceState())
 	return
 }
 
-// upLocked attempts to bring the device up and reports whether it succeeded.
-// The caller must hold device.state.mu and is responsible for updating device.state.state.
-func (device *Device) upLocked() error {
-	if err := device.BindUpdate(); err != nil {
-		device.log.Errorf("Unable to update bind: %v", err)
+// Brings the device up with the state and configuration locks held.
+func (self *Device) upWithLock() error {
+	if err := self.BindUpdate(); err != nil {
+		self.log.Errorf("Unable to update bind: %v", err)
 		return err
 	}
 
-	// The IPC set operation waits for peers to be created before calling Start() on them,
-	// so if there's a concurrent IPC set request happening, we should wait for it to complete.
-	device.ipcMutex.Lock()
-	defer device.ipcMutex.Unlock()
-
-	device.peers.RLock()
-	for _, peer := range device.peers.keyMap {
+	self.peers.RLock()
+	for _, peer := range self.peers.keyMap {
 		peer.Start()
 		if peer.persistentKeepaliveInterval.Load() > 0 {
 			peer.SendKeepalive()
 		}
 	}
-	device.peers.RUnlock()
+	self.peers.RUnlock()
 	return nil
 }
 
-// downLocked attempts to bring the device down.
-// The caller must hold device.state.mu and is responsible for updating device.state.state.
-func (device *Device) downLocked() error {
-	err := device.BindClose()
+// Brings the device down with the state and configuration locks held.
+func (self *Device) downWithLock() error {
+	err := self.BindClose()
 	if err != nil {
-		device.log.Errorf("Bind close failed: %v", err)
+		self.log.Errorf("Bind close failed: %v", err)
 	}
 
-	device.peers.RLock()
-	for _, peer := range device.peers.keyMap {
+	self.peers.RLock()
+	for _, peer := range self.peers.keyMap {
 		peer.Stop()
 	}
-	device.peers.RUnlock()
+	self.peers.RUnlock()
 	return err
 }
 
@@ -254,21 +251,30 @@ func (device *Device) ReceiveRoutineFailureCount() uint64 {
 	return device.receive.routineFailureCount.Load()
 }
 
-func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
+// Changes the device identity without overlapping peer configuration.
+func (self *Device) SetPrivateKey(sk NoisePrivateKey) error {
+	self.ipcMutex.Lock()
+	defer self.ipcMutex.Unlock()
+	return self.setPrivateKeyWithLock(sk)
+}
+
+// Changes the identity with the configuration lock held.
+func (self *Device) setPrivateKeyWithLock(sk NoisePrivateKey) error {
 	// lock required resources
 
-	device.staticIdentity.Lock()
-	defer device.staticIdentity.Unlock()
+	self.staticIdentity.Lock()
+	defer self.staticIdentity.Unlock()
 
-	if sk.Equals(device.staticIdentity.privateKey) {
+	if sk.Equals(self.staticIdentity.privateKey) {
 		return nil
 	}
+	self.invalidatePeerMissesWithLock()
 
-	device.peers.Lock()
-	defer device.peers.Unlock()
+	self.peers.Lock()
+	defer self.peers.Unlock()
 
-	lockedPeers := make([]*Peer, 0, len(device.peers.keyMap))
-	for _, peer := range device.peers.keyMap {
+	lockedPeers := make([]*Peer, 0, len(self.peers.keyMap))
+	for _, peer := range self.peers.keyMap {
 		peer.handshake.mutex.RLock()
 		lockedPeers = append(lockedPeers, peer)
 	}
@@ -276,26 +282,26 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 	// remove peers with matching public keys
 
 	publicKey := sk.publicKey()
-	for key, peer := range device.peers.keyMap {
+	for key, peer := range self.peers.keyMap {
 		if peer.handshake.remoteStatic.Equals(publicKey) {
 			peer.handshake.mutex.RUnlock()
-			removePeerLocked(device, peer, key)
+			removePeerWithLock(self, peer, key)
 			peer.handshake.mutex.RLock()
 		}
 	}
 
 	// update key material
 
-	device.staticIdentity.privateKey = sk
-	device.staticIdentity.publicKey = publicKey
-	device.cookieChecker.Init(publicKey)
+	self.staticIdentity.privateKey = sk
+	self.staticIdentity.publicKey = publicKey
+	self.cookieChecker.Init(publicKey)
 
 	// do static-static DH pre-computations
 
-	expiredPeers := make([]*Peer, 0, len(device.peers.keyMap))
-	for _, peer := range device.peers.keyMap {
+	expiredPeers := make([]*Peer, 0, len(self.peers.keyMap))
+	for _, peer := range self.peers.keyMap {
 		handshake := &peer.handshake
-		handshake.precomputedStaticStatic, _ = device.staticIdentity.privateKey.sharedSecret(handshake.remoteStatic)
+		handshake.precomputedStaticStatic, _ = self.staticIdentity.privateKey.sharedSecret(handshake.remoteStatic)
 		expiredPeers = append(expiredPeers, peer)
 	}
 
@@ -373,58 +379,76 @@ func (device *Device) LookupPeer(pk NoisePublicKey) *Peer {
 	return device.peers.keyMap[pk]
 }
 
-func (device *Device) RemovePeer(key NoisePublicKey) {
-	device.peers.Lock()
-	defer device.peers.Unlock()
+// Removes a peer and invalidates pending resolutions, even if no peer exists yet.
+func (self *Device) RemovePeer(key NoisePublicKey) {
+	self.ipcMutex.Lock()
+	defer self.ipcMutex.Unlock()
+	self.removePeerWithLock(key)
+}
+
+// Removes one generation with the configuration lock held.
+func (self *Device) removePeerWithLock(key NoisePublicKey) {
+	self.invalidatePeerMissWithLock(key)
+	self.peers.Lock()
+	defer self.peers.Unlock()
 	// stop peer and remove from routing
 
-	peer, ok := device.peers.keyMap[key]
+	peer, ok := self.peers.keyMap[key]
 	if ok {
-		removePeerLocked(device, peer, key)
+		removePeerWithLock(self, peer, key)
 	}
 }
 
-func (device *Device) RemoveAllPeers() {
-	device.peers.Lock()
-	defer device.peers.Unlock()
-
-	for key, peer := range device.peers.keyMap {
-		removePeerLocked(device, peer, key)
-	}
-
-	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
+// Removes all peers and invalidates resolutions started before the removal.
+func (self *Device) RemoveAllPeers() {
+	self.ipcMutex.Lock()
+	defer self.ipcMutex.Unlock()
+	self.removeAllPeersWithLock()
 }
 
-func (device *Device) Close() {
-	device.state.Lock()
-	defer device.state.Unlock()
-	device.ipcMutex.Lock()
-	defer device.ipcMutex.Unlock()
-	if device.isClosed() {
+// Removes all generations with the configuration lock held.
+func (self *Device) removeAllPeersWithLock() {
+	self.invalidatePeerMissesWithLock()
+	self.peers.Lock()
+	defer self.peers.Unlock()
+
+	for key, peer := range self.peers.keyMap {
+		removePeerWithLock(self, peer, key)
+	}
+
+	self.peers.keyMap = make(map[NoisePublicKey]*Peer)
+}
+
+func (self *Device) Close() {
+	self.state.Lock()
+	defer self.state.Unlock()
+	self.ipcMutex.Lock()
+	defer self.ipcMutex.Unlock()
+	if self.isClosed() {
 		return
 	}
-	device.state.state.Store(uint32(deviceStateClosed))
-	device.log.Verbosef("Device closing")
+	self.state.state.Store(uint32(deviceStateClosed))
+	self.log.Verbosef("Device closing")
 
-	device.tun.device.Close()
-	device.downLocked()
+	self.tun.device.Close()
+	self.downWithLock()
 
 	// Remove peers before closing queues,
 	// because peers assume that queues are active.
-	device.RemoveAllPeers()
+	self.removeAllPeersWithLock()
 
 	// We kept a reference to the encryption and decryption queues,
 	// in case we started any new peers that might write to them.
 	// No new peers are coming; we are done with these queues.
-	device.queue.encryption.wg.Done()
-	device.queue.decryption.wg.Done()
-	device.queue.handshake.wg.Done()
-	device.state.stopping.Wait()
+	self.queue.encryption.wg.Done()
+	self.queue.decryption.wg.Done()
+	self.queue.handshake.wg.Done()
+	self.state.stopping.Wait()
 
-	device.rate.limiter.Close()
+	self.rate.limiter.Close()
 
-	device.log.Verbosef("Device closed")
-	close(device.closed)
+	self.log.Verbosef("Device closed")
+	close(self.closed)
 }
 
 func (device *Device) Wait() chan struct{} {
