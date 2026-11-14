@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/urnetwork/userwireguard/conn"
+	"github.com/urnetwork/userwireguard/v2026/conn"
 )
 
 type Peer struct {
